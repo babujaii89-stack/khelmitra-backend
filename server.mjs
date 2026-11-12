@@ -1,4 +1,3 @@
-
 import http from 'node:http';
 import { URL } from 'node:url';
 
@@ -8,7 +7,7 @@ const SUPABASE_PUBLISHABLE_KEY =
   process.env.SUPABASE_PUBLISHABLE_KEY ||
   process.env.SUPABASE_ANON_KEY || '';
 
-const DATA_GOV_IN_API_KEY = process.env.DATA_GOV_IN_API_KEY || '';
+const DATA_GOV_IN_API_KEY = (process.env.DATA_GOV_IN_API_KEY || '').trim();
 
 const DATA_GOV_IN_MANDI_RESOURCE_ID =
   process.env.DATA_GOV_IN_MANDI_RESOURCE_ID ||
@@ -36,6 +35,13 @@ const seasonNow = () => {
 };
 
 const clamp = (n, min, max) => Math.max(min, Math.min(max, n));
+
+function normalizeLocation(value) {
+  return String(value || '')
+    .replace(/\b(district|dist\.?)\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
 
 function scoreCrops(profile, season) {
   const soil = profile.soil || {};
@@ -206,7 +212,7 @@ function fertilizerPlan(crop, soil = {}) {
     .map((t, i) => ({ ...t, id:`${crop.id}-${i}` }));
 }
 
-// Parse Indian and ISO date formats safely.
+// Parse Indian (DD/MM/YYYY) and ISO date formats safely.
 function parseMandiDate(value) {
   if (!value) return 0;
 
@@ -262,12 +268,15 @@ async function mandi(crops, district, state) {
     };
   }
 
+  const cleanState = normalizeLocation(state || MANDI_STATE);
+  const cleanDistrict = normalizeLocation(district);
+
   const quotes = await Promise.all(
     crops.map(async crop => {
       try {
         const allRecords = [];
-        const limit = 1000;
-        const maxPages = 5;
+        const limit = 500;
+        const maxPages = 6;
 
         for (let page = 0; page < maxPages; page++) {
           const url = new URL(
@@ -279,28 +288,33 @@ async function mandi(crops, district, state) {
           url.searchParams.set('limit', String(limit));
           url.searchParams.set('offset', String(page * limit));
 
-          url.searchParams.set('filters[state]', state || MANDI_STATE);
-          url.searchParams.set('filters[district]', district);
-          url.searchParams.set('filters[commodity]', crop);
+          if (cleanState) {
+            url.searchParams.set('filters[state]', cleanState);
+          }
+          url.searchParams.set('filters[district]', cleanDistrict);
+          url.searchParams.set('filters[commodity]', crop.trim());
 
-          // Request descending arrival-date order.
-          url.searchParams.set('sort[arrival_date]', 'desc');
+          // Note: Do NOT pass sort[arrival_date]=desc to data.gov.in because arrival_date
+          // is stored as a DD/MM/YYYY string and sorts alphabetically instead of chronologically.
 
           const response = await fetch(url, {
-            signal:AbortSignal.timeout(15000)
+            signal:AbortSignal.timeout(15000),
+            headers:{ Accept:'application/json' }
           });
 
           if (!response.ok) {
-            console.error('AGMARKNET HTTP error:', response.status);
-
-            return {
-              crop,
-              price:null,
-              market:null,
-              arrivalDate:null,
-              source:'data.gov.in',
-              note:`Mandi API returned HTTP ${response.status}`
-            };
+            if (page === 0) {
+              console.error('AGMARKNET HTTP error:', response.status);
+              return {
+                crop,
+                price:null,
+                market:null,
+                arrivalDate:null,
+                source:'data.gov.in',
+                note:`Mandi API returned HTTP ${response.status}`
+              };
+            }
+            break;
           }
 
           const body = await response.json();
@@ -308,7 +322,12 @@ async function mandi(crops, district, state) {
 
           allRecords.push(...pageRecords);
 
-          if (pageRecords.length < limit) break;
+          if (
+            pageRecords.length < limit ||
+            (typeof body.total === 'number' && (page + 1) * limit >= body.total)
+          ) {
+            break;
+          }
         }
 
         const records = allRecords
@@ -322,12 +341,12 @@ async function mandi(crops, district, state) {
               record.market ??
               record.market_name ??
               ''
-            ),
+            ).trim(),
             arrivalDate:String(
               record.arrival_date ??
               record.arrivalDate ??
               ''
-            )
+            ).trim()
           }))
           .filter(record =>
             record.price > 0 &&
@@ -339,17 +358,42 @@ async function mandi(crops, district, state) {
             parseMandiDate(a.arrivalDate)
           );
 
-        const latest = records[0];
+        if (!records.length) {
+          return {
+            crop,
+            price:null,
+            market:null,
+            arrivalDate:null,
+            source:'AGMARKNET via data.gov.in',
+            note:`No valid matching market records found for ${crop} in ${cleanDistrict}.`
+          };
+        }
+
+        const latestTs = parseMandiDate(records[0].arrivalDate);
+        const latestDayRecords = records.filter(
+          r => parseMandiDate(r.arrivalDate) === latestTs
+        );
+
+        const avgPrice = Math.round(
+          latestDayRecords.reduce((sum, r) => sum + r.price, 0) /
+          latestDayRecords.length
+        );
+
+        const uniqueMarkets = Array.from(
+          new Set(latestDayRecords.map(r => r.market).filter(Boolean))
+        );
+
+        const marketLabel =
+          uniqueMarkets.length > 1
+            ? `${uniqueMarkets[0]} (+${uniqueMarkets.length - 1} mandis)`
+            : uniqueMarkets[0] || null;
 
         return {
           crop,
-          price:latest?.price ?? null,
-          market:latest?.market ?? null,
-          arrivalDate:latest?.arrivalDate ?? null,
-          source:'AGMARKNET via data.gov.in',
-          ...(!latest
-            ? { note:'No valid matching market records found.' }
-            : {})
+          price:avgPrice,
+          market:marketLabel,
+          arrivalDate:latestDayRecords[0].arrivalDate || null,
+          source:'AGMARKNET via data.gov.in'
         };
 
       } catch (error) {
